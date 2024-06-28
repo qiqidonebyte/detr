@@ -85,7 +85,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -122,6 +122,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 res_pano[i]["file_name"] = file_name
 
             panoptic_evaluator.update(res_pano)
+    # 每处理10个批次，打印日志
+    if (i + 1) % 10 == 0:
+        print(f"Processed {i + 1} batches")
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

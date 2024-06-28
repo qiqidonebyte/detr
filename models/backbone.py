@@ -73,7 +73,7 @@ class BackboneBase(nn.Module):
         self.num_channels = num_channels
 
     def forward(self, tensor_list: NestedTensor):
-        print(f"Shape before processing: {tensor_list.tensors.shape}, Type: {tensor_list.tensors.dtype}")
+        # print(f"Shape before processing: {tensor_list.tensors.shape}, Type: {tensor_list.tensors.dtype}")
         xs = self.body(tensor_list.tensors)
         out: Dict[str, NestedTensor] = {}
         for name, x in xs.items():
@@ -168,6 +168,7 @@ class BackboneWithFPN2(nn.Module):
         })
 
     def forward(self, tensor_list: NestedTensor):
+        print(f"tensor_list: {tensor_list.tensors.shape}")
         xs = self.body(tensor_list.tensors)
         # print(f"xs : {type(xs)}, xs:{xs.keys()}")
         # 将特征通过FPN，得到多尺度特征图

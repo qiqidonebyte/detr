@@ -8,6 +8,7 @@ Copy-paste from torch.nn.Transformer with modifications:
     * decoder returns a stack of activations from all decoding layers
 """
 import copy
+import math
 from typing import Optional, List
 
 import torch
@@ -20,16 +21,30 @@ class Transformer(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
-                 return_intermediate_dec=False):
+                 return_intermediate_dec=False, local_attn=False):
         super().__init__()
 
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+        # encoder 这里进行选择是否使用窗口注意力
+        if local_attn:
+            window_size = 20
+            encoder_layer = LocalSelfAttentionEncoderLayer(d_model, nhead, window_size,
+                                                           dim_feedforward,
+                                                           dropout)
+        else:
+            encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+                                                    dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+        # decoder 这里进行选择是否使用窗口注意力
+        if local_attn:
+            window_size = 20
+            decoder_layer = LocalSelfAttentionDecoderLayer(d_model, nhead, window_size,
+                                                           dim_feedforward,
+                                                           dropout)
+        else:
+            decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+                                                    dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec)
@@ -269,6 +284,114 @@ class TransformerDecoderLayer(nn.Module):
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
 
 
+class LocalSelfAttention(nn.Module):
+    def __init__(self, embed_dim, window_size, dropout_rate=0.1):
+        super(LocalSelfAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.window_size = window_size
+        self.scale = math.sqrt(self.embed_dim)
+        self.attn_drop = nn.Dropout(dropout_rate)  # Dropout层
+        # 查询（Q）、键（K）、值（V）的线性层
+        self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3, bias=True)
+
+        # 输出的线性层
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        # 创建局部注意力掩码，只关注当前元素之前的元素（下三角掩码）
+        mask = torch.zeros(window_size, window_size)
+        mask[torch.arange(window_size), torch.arange(window_size)] = 1
+        mask = mask.unsqueeze(0).unsqueeze(0)  # 增加两个维度，形状变为 [1, 1, window_size, window_size]
+        self.register_buffer('mask', mask)  # 注册掩码为模型的缓冲区
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv_proj(x).view(B, N, 3, C // 3)
+        q, k, v = qkv.permute(0, 2, 1, 3), qkv.permute(0, 1, 2, 3), qkv
+        # 用chunk方法将qkv分割为三个部分
+        # qkv = self.qkv_proj(x).chunk(3, dim=-1)
+        # q, k, v = map(lambda t: t.reshape(B, N, 1, C), qkv)
+
+        # 计算注意力分数
+        attn = torch.einsum('bnc,bmc->bnm', q, k.transpose(-2, -1)) * self.scale
+        attn = attn.masked_fill(self.mask == 0, float('-inf'))
+
+        # 应用softmax归一化和dropout
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        # 计算加权输出
+        output = torch.einsum('bnm,bmc->bnc', attn, v)
+        output = output.permute(0, 2, 1, 3).contiguous().view(B, N, C)
+        # 通过输出的线性层
+        output = self.out_proj(output)
+        return output
+
+
+class LocalSelfAttentionEncoderLayer(nn.TransformerEncoderLayer):
+    def __init__(self, d_model, nhead, window_size, dim_feedforward=2048, dropout=0.1):
+        super().__init__(d_model, nhead, dim_feedforward, dropout)
+        # 使用局部自注意力替换标准自注意力
+        self.self_attn = LocalSelfAttention(d_model, window_size)
+        # 由于我们重写了自注意力，以下部分不再需要
+        # self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # self.linear1 = nn.Linear(dim_feedforward, d_model)
+        # self.dropout = nn.Dropout(dropout)
+        # self.norm1 = nn.LayerNorm(d_model)
+        # self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        # 调用局部自注意力
+        src2 = self.self_attn(src)
+        # 残差连接和层归一化
+        src = src + self.dropout(src2)
+        src = self.norm1(src)
+
+        # 前馈网络部分保持不变，这里使用原始的前馈网络
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout(src2)
+        src = self.norm2(src)
+
+        return src
+
+
+class LocalSelfAttentionDecoderLayer(nn.TransformerDecoderLayer):
+    def __init__(self, d_model, nhead, window_size, dim_feedforward=2048, dropout=0.1):
+        super().__init__(d_model, nhead, dim_feedforward, dropout)
+        # 使用局部自注意力替换标准自注意力
+        self.self_attn = LocalSelfAttention(d_model, window_size)
+        # 编码器-解码器注意力，这里不需要局部自注意力掩码
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
+                tgt_key_padding_mask=None, memory_key_padding_mask=None):
+        # 添加掩码以防止解码器看到未来的信息
+        tgt_mask = self.generate_square_subsequent_mask(tgt.size(0)) if tgt_mask is None else tgt_mask
+
+        # 自注意力，使用局部自注意力
+        tgt2 = self.self_attn(tgt, tgt, tgt, attn_mask=tgt_mask)
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        # 编码器-解码器注意力
+        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        # 前馈网络
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm3(tgt)
+
+        return tgt
+
+    def generate_square_subsequent_mask(self, sz):
+        # 为解码器生成掩码，防止看到未来的信息
+        mask = torch.triu(torch.ones(sz, sz), diagonal=1)  # 创建一个下三角矩阵，对角线为1
+        mask = mask.transpose(0, 1).float()  # 转置并转换为浮点数
+        mask = mask.masked_fill(mask == 1, float('-inf')).masked_fill(mask == 0, float(0.0))
+        return mask[None, :, :]
+
+
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
@@ -283,6 +406,7 @@ def build_transformer(args):
         num_decoder_layers=args.dec_layers,
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
+        local_attn=args.local_attn,
     )
 
 

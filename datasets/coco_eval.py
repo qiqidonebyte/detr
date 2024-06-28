@@ -36,11 +36,12 @@ class CocoEvaluator(object):
     def update(self, predictions):
         img_ids = list(np.unique(list(predictions.keys())))
         self.img_ids.extend(img_ids)
-
+        # print(f"predictions: {type(predictions)}, size:{len(predictions)}, {predictions.keys()}")
         for iou_type in self.iou_types:
             results = self.prepare(predictions, iou_type)
-
+            # print(f"results: {type(results)}, size:{len(results)}")
             # suppress pycocotools prints
+            # print(f"coco gt: {self.coco_gt}")
             with open(os.devnull, 'w') as devnull:
                 with contextlib.redirect_stdout(devnull):
                     coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
